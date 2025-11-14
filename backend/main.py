@@ -6,8 +6,12 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import func
 
-app = FastAPI(title="CinemaThisWeek API")
+from .db import SessionLocal
+from .models import Clue, DailySelection, Movie
+
+app = FastAPI(title="CinemaToday API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,24 +23,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# --------------------------------------------------------------------
-# Hard-coded movie stub for now
-# Later this will come from Postgres + ingestion/LLM pipeline
-# --------------------------------------------------------------------
-
-
-MOVIE_TITLE = "Jaws"
-MOVIE_SLUG = "daily-movie-stub"
-MOVIE_POSTER_URL = (
-    "https://i.ebayimg.com/images/g/8~QAAOSwyQtVoRQC/s-l1200.jpg"  # placeholder for now
-)
-
-MOVIE_CLUES: List[str] = [
-    "A quiet coastal town is disrupted by an unusual threat.",
-    "The danger lurks beneath the surface, unseen but deadly.",
-    "A small-town sheriff, a marine biologist, and a fisherman join forces.",
-    "An iconic poster shows a swimmer above a large open mouth full of teeth.",
-]
 
 # --------------------------------------------------------------------
 # Pydantic models
@@ -91,80 +77,102 @@ def health_check() -> dict:
 @app.get("/today-game", response_model=TodayGameResponse)
 def get_today_game() -> TodayGameResponse:
     """
-    Return today's game state.
+    Return a random game from the movies table.
 
-    For now this always returns the same hard-coded movie and the first clue.
+    For now this picks a random movie every time, ignoring the calendar.
     """
-    if not MOVIE_CLUES:
-        raise HTTPException(
-            status_code=500, detail="No clues configured for today's movie."
-        )
+    session = SessionLocal()
+    try:
+        movie = session.query(Movie).order_by(func.random()).first()
+        if not movie:
+            raise HTTPException(status_code=404, detail="No movies available.")
 
-    return TodayGameResponse(
-        game_date=date.today(),
-        movie_slug=MOVIE_SLUG,
-        total_clues=len(MOVIE_CLUES),
-        current_clue_index=0,
-        current_clue_text=MOVIE_CLUES[0],
-        solved=False,
-    )
+        clues = (
+            session.query(Clue)
+            .filter(Clue.movie_id == movie.id)
+            .order_by(Clue.order_index.asc())
+            .all()
+        )
+        if not clues:
+            raise HTTPException(status_code=500, detail="No clues for selected movie.")
+
+        first_clue = clues[0]
+
+        return TodayGameResponse(
+            game_date=date.today(),
+            movie_slug=movie.slug,
+            total_clues=len(clues),
+            current_clue_index=first_clue.order_index,
+            current_clue_text=first_clue.text,
+            solved=False,
+        )
+    finally:
+        session.close()
 
 
 @app.post("/guess", response_model=GuessResponse)
 def submit_guess(payload: GuessRequest) -> GuessResponse:
     """
-    Check a guess for today's movie and return either:
-    - success + reveal, or
-    - next clue, or
-    - game over + reveal if out of clues.
+    Check a guess for a given movie_slug using data from the database.
     """
-    # Check movie slug matches the current game
-    if payload.movie_slug != MOVIE_SLUG:
-        raise HTTPException(
-            status_code=400, detail="Unknown movie slug for today's game."
+    session = SessionLocal()
+    try:
+        movie = session.query(Movie).filter(Movie.slug == payload.movie_slug).first()
+
+        if not movie:
+            raise HTTPException(status_code=400, detail="Unknown movie slug.")
+
+        clues = (
+            session.query(Clue)
+            .filter(Clue.movie_id == movie.id)
+            .order_by(Clue.order_index.asc())
+            .all()
         )
+        if not clues:
+            raise HTTPException(status_code=500, detail="No clues for this movie.")
 
-    # Validate clue index
-    if payload.current_clue_index < 0 or payload.current_clue_index >= len(MOVIE_CLUES):
-        raise HTTPException(status_code=400, detail="Invalid clue index.")
+        if payload.current_clue_index < 0 or payload.current_clue_index >= len(clues):
+            raise HTTPException(status_code=400, detail="Invalid clue index.")
 
-    normalised_guess = normalise_title(payload.guess)
-    normalised_title = normalise_title(MOVIE_TITLE)
+        normalised_guess = normalise_title(payload.guess)
+        normalised_title = normalise_title(movie.title)
 
-    # Correct answer
-    if normalised_guess == normalised_title:
+        # Correct
+        if normalised_guess == normalised_title:
+            return GuessResponse(
+                correct=True,
+                finished=True,
+                next_clue_index=payload.current_clue_index,
+                next_clue_text=None,
+                reveal_title=movie.title,
+                reveal_poster_url=movie.poster_url,
+                message="Nice! You got it right.",
+            )
+
+        # Wrong, see if we have another clue
+        next_index = payload.current_clue_index + 1
+
+        if next_index < len(clues):
+            next_clue = clues[next_index]
+            return GuessResponse(
+                correct=False,
+                finished=False,
+                next_clue_index=next_index,
+                next_clue_text=next_clue.text,
+                reveal_title=None,
+                reveal_poster_url=None,
+                message="Nope, have another clue.",
+            )
+
+        # Out of clues
         return GuessResponse(
-            correct=True,
+            correct=False,
             finished=True,
             next_clue_index=payload.current_clue_index,
             next_clue_text=None,
-            reveal_title=MOVIE_TITLE,
-            reveal_poster_url=MOVIE_POSTER_URL,
-            message="Congrats! You got it right.",
+            reveal_title=movie.title,
+            reveal_poster_url=movie.poster_url,
+            message=f"Out of clues! The film was {movie.title}.",
         )
-
-    # Incorrect answer, check if there are more clues
-    next_index = payload.current_clue_index + 1
-
-    # There is another clue available
-    if next_index < len(MOVIE_CLUES):
-        return GuessResponse(
-            correct=False,
-            finished=False,
-            next_clue_index=next_index,
-            next_clue_text=MOVIE_CLUES[next_index],
-            reveal_title=None,
-            reveal_poster_url=None,
-            message="Nope, have another clue.",
-        )
-
-    # No more clues: game over, reveal the film
-    return GuessResponse(
-        correct=False,
-        finished=True,
-        next_clue_index=payload.current_clue_index,
-        next_clue_text=None,
-        reveal_title=MOVIE_TITLE,
-        reveal_poster_url=MOVIE_POSTER_URL,
-        message=f"Out of clues! The film was {MOVIE_TITLE}.",
-    )
+    finally:
+        session.close()
